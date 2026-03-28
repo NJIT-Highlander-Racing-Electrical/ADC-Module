@@ -1,4 +1,5 @@
 # Analog-to-Digital Converter (ADC) Module
+Primary Developers: Alex & Faarid
 Consolidated module for reading all analog sensors on the vehicle (ie. suspension displacement and brake pressure).
 ## About
 This module utilizes two Adafruit ADS1015 breakout boards, with pads allocated for voltage dividers, to read analog inputs from various sensors. The data is then processed and sent over CAN Bus.
