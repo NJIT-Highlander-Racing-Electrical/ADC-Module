@@ -1,112 +1,127 @@
+/**********************************************
+ * NJIT Highlander Racing
+ * 8-Channel ADC
+ * Author(s): Alexander Huegler, Andrew Santella
+ * 2025-2026 Season
+ **********************************************/
+
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_ADS1X15.h>
 #include <BajaCAN.h>
 
-Adafruit_ADS1015 ads0; // Use ADS1015 (12-bit) version
-Adafruit_ADS1015 ads1; // Use ADS1015 (12-bit) version
+ // Resistor Divider Values
+#define R1 20000.0f
+#define R2 43000.0f
+#define DIVIDER_RATIO (R2 / (R1 + R2))
 
-// Calibration variables
-// LPPS-20-250: max extension is 250 mm
-const float calibrationFactor_frontLeft = 3.31;
-const float calibrationFactor_frontRight = 3.1;
-const float calibrationFactor_rearLeft = 3.1;
-const float calibrationFactor_rearRight = 3.1;
+Adafruit_ADS1015 ads0; // Brake pressure  (ADDR → VCC = 0x49)
+Adafruit_ADS1015 ads1; // Displacement    (ADDR → GND = 0x48)
 
-// Function declarations
-void serialDataOutput();
+/**********************************************
+ * Suspension Potentiometer Calibration:
+ *
+ *  1. Rough pass. Set all calibration factors in COUNTS_PER_INCH[] to -1. Push
+ *     sensors all the way in, upload code, and power on the system. Calibration
+ *     factor will be calculated using the following formula:
+ *     (counts_at_far - counts_at_near) / (far_inches - near_inches).
+ *     Counts are reported in the serial output and inches are measured directly.
+ *     Repeat for each sensor.
+ *  2. Fine pass. Once each sensor is roughly calibrated, begin checking reported
+ *     measurements against measurements taken by hand. Adjust calibration factors
+ *     in small increments until measurements are as close as possible. They will
+ *     likely never be perfect, as the measurment circuits may induce some
+ *     non-linearity.
+ *
+ * Brake Transducer Calibration:
+ *
+ *  The transducer signal is run through a voltage (43k / (20k + 43k))divider
+ *  before it is measured by the ADC.
+ *
+ *  1. Change the R1 and R2 macros to match ones actually used.
+ *
+**********************************************/
+
+// Suspension Calibration Factors: { RR, FR, RL, FL}
+const float COUNTS_PER_INCH[] = { -166.25, -166, -166.25, -166.25 };
+
+// Suspension Zero Offsets (captured at startup)
+// All displacement readings are relative to these startup counts!
+int16_t zeroCount[4] = { 0, 0, 0, 0 };
+
+// Function Declarations
+void zeroSuspensionSensors();
 void readDisplacementSensors();
 void readBrakePressureSensors();
+void serialDataOutput();
+float rawToPSI(int16_t raw);
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(460800);
+  while (!Serial);
+  delay(500);
 
-  // Initialize I2C on the ESP32 (Default is 21 & 22)
-  if (!ads0.begin(0x49)) {
-    Serial.println("Failed to initialize ADS1015_0. Check wiring!");
-    while (1);
-  }
-  else {
-    Serial.println("Intialized ADS1015_0 successfully!");
-  }
-  if (!ads1.begin(0x48)) {
-    Serial.println("Failed to initialize ADS1015_1. Check wiring!");
-    while (1);
-  }
-  else {
-    Serial.println("Intialized ADS1015_1 successfully!");
-  }
+  if (!ads0.begin(0x49)) { Serial.println("ADS1015_0 (brake) not found!"); while (1); }
+  if (!ads1.begin(0x48)) { Serial.println("ADS1015_1 (suspension) not found!"); while (1); }
 
-  // Set gain to +/- 4.096V (1 bit = 2mV in 12-bit mode)
-  // Options: GAIN_TWOTHIRDS, GAIN_ONE, GAIN_TWO, GAIN_FOUR, GAIN_EIGHT, GAIN_SIXTEEN
-  ads0.setGain(GAIN_ONE);
+  ads0.setGain(GAIN_ONE);  // ±4.096V, 2mV/count on ADS1015
   ads1.setGain(GAIN_ONE);
 
-  // setup CAN
-  setupCAN(WHEEL_SPEED);
+  zeroSuspensionSensors();
+  setupCAN(WHEEL_SPEED, 10);
 }
 
 void loop() {
-  int16_t adc0;
-  float volts;
-
   readDisplacementSensors();
-
+  readBrakePressureSensors();
   serialDataOutput();
-
-  delay(100);
+  vTaskDelay(pdMS_TO_TICKS(100));
 }
 
-void serialDataOutput() {
-  Serial.println("____________________________________________");
-  Serial.println("|  FL  |  FR  |  RL  |  RR  ||  FB  |  RB  |");
-  Serial.println("|------|------|------|------||------|------|");
-
-  Serial.print("| ");
-  Serial.print(frontLeftDisplacement);
-  Serial.print(" | ");
-  Serial.print(frontRightDisplacement);
-  Serial.print(" | ");
-  Serial.print(rearLeftDisplacement);
-  Serial.print(" | ");
-  Serial.print(rearRightDisplacement);
-  Serial.print(" ||  ");
-  Serial.print(frontBrakePressure);
-  Serial.print("   |   ");
-  Serial.print(rearBrakePressure);
-  Serial.println("  |");
-
-  Serial.println("|------|------|------|------||------|------|");
-}
-
-void readDisplacementSensors() {
-  float adc_values[4];
-
-  // Read all four inputs of ADC 1 and convert to volts
+// Capture suspension sensor positions at startup to use as relative zero.
+void zeroSuspensionSensors() {
   for (int i = 0; i < 4; i++) {
-    adc_values[i] = ads1.computeVolts(ads1.readADC_SingleEnded(i));
+    zeroCount[i] = ads1.readADC_SingleEnded(i);
   }
+  Serial.println("Suspension zeroed.");
+  Serial.print("  Zero counts — FL:"); Serial.print(zeroCount[3]);
+  Serial.print("  FR:"); Serial.print(zeroCount[1]);
+  Serial.print("  RL:"); Serial.print(zeroCount[2]);
+  Serial.print("  RR:"); Serial.println(zeroCount[0]);
+}
 
-  // Convert volts to cm for each sensor
-  adc_values[0] = adc_values[0] / calibrationFactor_frontLeft * 25;
-  adc_values[1] = adc_values[1] / calibrationFactor_frontRight * 25;
-  adc_values[2] = adc_values[2] / calibrationFactor_rearLeft * 25;
-  adc_values[3] = adc_values[3] / calibrationFactor_rearRight * 25;
-
-  frontLeftDisplacement = adc_values[0];
-  frontRightDisplacement = adc_values[1];
-  rearLeftDisplacement = adc_values[2];
-  rearRightDisplacement = adc_values[3];
+// Positive = compression (shock pushed inward from zero).
+// Negative = extension  (shock pulled outward from zero).
+void readDisplacementSensors() {
+  frontLeftDisplacement = (ads1.readADC_SingleEnded(3) - zeroCount[3]) / COUNTS_PER_INCH[3];
+  frontRightDisplacement = (ads1.readADC_SingleEnded(1) - zeroCount[1]) / COUNTS_PER_INCH[1];
+  rearLeftDisplacement = (ads1.readADC_SingleEnded(2) - zeroCount[2]) / COUNTS_PER_INCH[2];
+  rearRightDisplacement = (ads1.readADC_SingleEnded(0) - zeroCount[0]) / COUNTS_PER_INCH[0];
 }
 
 void readBrakePressureSensors() {
-  float adc_values[2];
+  frontBrakePressure = rawToPSI(ads0.readADC_SingleEnded(0));
+  rearBrakePressure = rawToPSI(ads0.readADC_SingleEnded(1));
+}
 
-  // Read first two inputs of ADC 0 and convert to volts
-  for (int i = 0; i < 2; i++) {
-    adc_values[i] = ads0.computeVolts(ads0.readADC_SingleEnded(i));
-  }
+// Convert raw counts to PSI
+float rawToPSI(int16_t raw) {
+  float vSensor = ads0.computeVolts(raw) / DIVIDER_RATIO;  // undo the divider
+  float psi = ((vSensor - 0.5f) / 4.0f) * 2000.0f;
+  return constrain(psi, 0.0f, 2000.0f);
+}
 
-  frontBrakePressure = adc_values[0];
-  rearBrakePressure = adc_values[1];
+// Serial Output
+void serialDataOutput() {
+  Serial.println("____________________________________________________________________");
+  Serial.println("|    FL    |    FR    |    RL    |    RR    ||  FB PSI  |  RB PSI  |");
+  Serial.println("|----------|----------|----------|----------||----------|----------|");
+  Serial.printf("| %6.2f\"  | %6.2f\"  | %6.2f\"  | %6.2f\"  || %8d | %8d |\n",
+    frontLeftDisplacement,
+    frontRightDisplacement,
+    rearLeftDisplacement,
+    rearRightDisplacement,
+    (int)frontBrakePressure,
+    (int)rearBrakePressure);
+  Serial.println("|----------|----------|----------|----------||----------|----------|");
 }
