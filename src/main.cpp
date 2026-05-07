@@ -68,7 +68,7 @@ void setup() {
   ads1.setGain(GAIN_ONE);
 
   zeroSuspensionSensors();
-  setupCAN(WHEEL_SPEED, 10);
+  setupCAN(ADC, 10);
 }
 
 void loop() {
